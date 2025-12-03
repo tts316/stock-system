@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 # --- 1. 系統設定區 ---
-st.set_page_config(page_title="股務管理系統 (交易審核版)", layout="wide")
+st.set_page_config(page_title="股務管理系統 (全功能完整版)", layout="wide")
 
 # Email 設定
 SMTP_SERVER = "smtp.gmail.com"
@@ -35,7 +35,7 @@ class GoogleSheetDB:
             self.ws_shareholders = self.sh.worksheet("shareholders")
             self.ws_transactions = self.sh.worksheet("transactions")
             self.ws_admin = self.sh.worksheet("system_admin")
-            self.ws_requests = self.sh.worksheet("requests") # 新增申請表
+            self.ws_requests = self.sh.worksheet("requests")
         except Exception as e:
             st.error(f"連線 Google Sheets 失敗: {e}")
             st.stop()
@@ -53,40 +53,74 @@ class GoogleSheetDB:
             except APIError: time.sleep(1)
         return pd.DataFrame()
 
-    # --- 申請單相關功能 (新) ---
+    # --- 核心功能: 批次匯入 (極速版) ---
+    def batch_import_from_excel(self, df_excel, replace_shares=False):
+        try:
+            current_records = self.ws_shareholders.get_all_records()
+            db_map = {str(item['tax_id']).strip(): item for item in current_records}
+            updated_count = 0
+            
+            for index, row in df_excel.iterrows():
+                tid = str(row.get("身分證或統編", "")).strip()
+                if not tid: continue
+                nm = str(row.get("姓名", "")).strip()
+                tp = "Corporate" if "法人" in str(row.get("身分別", "")) else "Individual"
+                addr = str(row.get("地址", "")); rep = str(row.get("代表人", ""))
+                email = str(row.get("Email", "")); hint = str(row.get("密碼提示", ""))
+                
+                excel_shares = 0
+                try:
+                    raw_shares = row.get("持股數") if "持股數" in row else row.get("初始持股數", 0)
+                    excel_shares = int(raw_shares)
+                except: excel_shares = 0
+
+                if tid in db_map:
+                    target = db_map[tid]
+                    target.update({'name': nm, 'holder_type': tp, 'address': addr, 'representative': rep, 'email': email, 'password_hint': hint})
+                    if excel_shares >= 0:
+                        if replace_shares: target['shares_held'] = excel_shares
+                        else: target['shares_held'] = int(target['shares_held'] or 0) + excel_shares
+                else:
+                    db_map[tid] = {
+                        'tax_id': tid, 'name': nm, 'holder_type': tp, 'representative': rep, 
+                        'address': addr, 'email': email, 'password_hint': hint, 
+                        'shares_held': excel_shares, 'password': ""
+                    }
+                updated_count += 1
+
+            final_data = []
+            headers = ["tax_id", "name", "holder_type", "representative", "address", "email", "password_hint", "shares_held", "password"]
+            for key, val in db_map.items():
+                final_data.append([
+                    val.get('tax_id'), val.get('name'), val.get('holder_type', 'Individual'), val.get('representative', ''),
+                    val.get('address', ''), val.get('email', ''), val.get('password_hint', ''), val.get('shares_held', 0), val.get('password', '')
+                ])
+
+            self.ws_shareholders.clear()
+            self.ws_shareholders.append_row(headers)
+            self.ws_shareholders.append_rows(final_data)
+            return True, f"處理完成！共 {updated_count} 筆，資料庫總計 {len(final_data)} 人。"
+        except Exception as e: return False, f"匯入失敗: {str(e)}"
+
+    # --- 申請單相關 ---
     def add_request(self, applicant_id, target_id, amount):
         try:
-            req_id = int(time.time()) # 用時間戳記當 ID
+            req_id = int(time.time())
             date_str = datetime.now().strftime("%Y-%m-%d")
-            # 寫入: id, date, applicant, target, amount, status
             self.ws_requests.append_row([req_id, date_str, applicant_id, target_id, amount, "Pending"])
             return True, "申請已送出，待管理員審核。"
         except Exception as e: return False, str(e)
 
     def approve_request(self, req_id, date, seller_id, buyer_id, amount):
         try:
-            # 1. 執行過戶
             success, msg = self.transfer_shares(date, seller_id, buyer_id, amount, "股東申請交易")
             if not success: return False, msg
-            
-            # 2. 更新申請單狀態為 Approved
             cell = self.ws_requests.find(str(req_id), in_column=1)
-            if cell:
-                self.ws_requests.update_cell(cell.row, 6, "Approved") # Col 6 is status
-            
-            return True, "審核通過，已完成過戶！"
+            if cell: self.ws_requests.update_cell(cell.row, 6, "Approved")
+            return True, "審核通過，已過戶！"
         except Exception as e: return False, str(e)
 
-    def reject_request(self, req_id):
-        try:
-            cell = self.ws_requests.find(str(req_id), in_column=1)
-            if cell:
-                self.ws_requests.update_cell(cell.row, 6, "Rejected")
-                return True, "已駁回申請"
-            return False, "找不到該申請單"
-        except Exception as e: return False, str(e)
-
-    # --- 原有核心功能 ---
+    # --- 基本功能 ---
     def upsert_shareholder(self, tax_id, name, holder_type, address, representative, email, hint):
         try:
             tax_id = str(tax_id).strip()
@@ -111,10 +145,8 @@ class GoogleSheetDB:
             cell = ws.find(user_id, in_column=1)
             if cell:
                 row = cell.row
-                if is_admin:
-                    ws.update_cell(row, 2, new_password); ws.update_cell(row, 4, new_hint)
-                else:
-                    ws.update_cell(row, 9, new_password); ws.update_cell(row, 7, new_hint)
+                if is_admin: ws.update_cell(row, 2, new_password); ws.update_cell(row, 4, new_hint)
+                else: ws.update_cell(row, 9, new_password); ws.update_cell(row, 7, new_hint)
                 return True
             return False
         except: return False
@@ -142,7 +174,6 @@ class GoogleSheetDB:
             ws = self.ws_admin if is_admin_attempt else self.ws_shareholders
             try: cell = ws.find(username, in_column=1)
             except: time.sleep(1); cell = ws.find(username, in_column=1)
-            
             if not cell: return False, "無此帳號", None
             row_vals = ws.row_values(cell.row)
             if is_admin_attempt:
@@ -154,7 +185,6 @@ class GoogleSheetDB:
                 stored_hint = row_vals[6] if len(row_vals)>6 else ""
                 stored_pass = row_vals[8] if len(row_vals)>8 else ""
                 if stored_pass == "": stored_pass = username 
-            
             if str(stored_pass) == str(password): return True, name, None
             else: return False, "密碼錯誤", stored_hint
         except Exception as e: return False, f"系統錯誤: {e}", None
@@ -168,12 +198,6 @@ class GoogleSheetDB:
                 self.ws_shareholders.update_cell(row, 8, curr + amount)
         except: pass
 
-    def set_share_count(self, tax_id, amount):
-        try:
-            cell = self.ws_shareholders.find(tax_id, in_column=1)
-            if cell: self.ws_shareholders.update_cell(cell.row, 8, amount)
-        except: pass
-
     def delete_shareholder(self, tax_id):
         try:
             cell = self.ws_shareholders.find(tax_id, in_column=1)
@@ -182,34 +206,21 @@ class GoogleSheetDB:
         
     def delete_batch_shareholders(self, tax_id_list):
         try:
-            for tid in tax_id_list:
-                self.delete_shareholder(tid); time.sleep(0.5)
+            # 為了安全且簡單，重整整個表
+            current = self.ws_shareholders.get_all_records()
+            new_recs = [r for r in current if str(r['tax_id']) not in tax_id_list]
+            headers = ["tax_id", "name", "holder_type", "representative", "address", "email", "password_hint", "shares_held", "password"]
+            final_data = []
+            for item in new_recs:
+                final_data.append([
+                    item['tax_id'], item['name'], item['holder_type'], item['representative'],
+                    item['address'], item['email'], item['password_hint'], item['shares_held'], item['password']
+                ])
+            self.ws_shareholders.clear()
+            self.ws_shareholders.append_row(headers)
+            self.ws_shareholders.append_rows(final_data)
             return True, f"已刪除 {len(tax_id_list)} 筆"
         except Exception as e: return False, str(e)
-
-    def batch_import_from_excel(self, df_excel, replace_shares=False):
-        # ... (維持之前的極速版邏輯，省略以節省篇幅，請保留原有的 batch_import) ...
-        # 為確保功能完整，這裡用簡化版 (單筆) 或請您保留上一版的 batch_import_from_excel
-        # 這裡示範單筆 fallback，建議您若有大量需求可將上一版 batch 函數貼回來
-        count = 0
-        for i, r in df_excel.iterrows():
-            try:
-                tid = str(r.get("身分證或統編", "")).strip()
-                if not tid: continue
-                nm = str(r.get("姓名", "")).strip()
-                tp = "Corporate" if "法人" in str(r.get("身分別", "")) else "Individual"
-                addr = str(r.get("地址", "")); rep = str(r.get("代表人", ""))
-                email = str(r.get("Email", "")); hint = str(r.get("密碼提示", ""))
-                self.upsert_shareholder(tid, nm, tp, addr, rep, email, hint)
-                try:
-                    qty = int(r.get("持股數", 0))
-                    if qty >= 0:
-                        if replace_shares: self.set_share_count(tid, qty)
-                        else: self.issue_shares(tid, qty)
-                except: pass
-                count += 1
-            except: pass
-        return True, f"已處理 {count} 筆"
 
     def transfer_shares(self, date, seller_tax_id, buyer_tax_id, amount, reason):
         try:
@@ -238,8 +249,17 @@ except: st.error("連線逾時"); st.stop()
 
 # --- UI Components ---
 def send_recovery_email(to_email, user_id, password):
-    # ... (維持原樣) ...
-    return True, "模擬發送成功"
+    if not SENDER_EMAIL or not SENDER_PASSWORD: return True, "模擬發送成功"
+    try:
+        msg = MIMEText(f"帳號：{user_id}\n密碼：{password}", 'plain', 'utf-8')
+        msg['Subject'] = '密碼找回'
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = to_email
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls(); server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg); server.quit()
+        return True, "已發送"
+    except Exception as e: return False, str(e)
 
 @st.dialog("🔑 忘記密碼")
 def show_forgot_password_dialog():
@@ -248,188 +268,59 @@ def show_forgot_password_dialog():
         info = sys.get_user_recovery_info(user_input, user_input=="admin")
         if info:
             st.success("找到帳號"); st.info(f"提示：{info['hint']}")
+            if info['email'] and st.button("📧 寄送密碼"): send_recovery_email(info['email'], user_input, info['password'])
         else: st.error("無此帳號")
 
 @st.dialog("🔑 修改密碼")
 def show_password_dialog(user_role, user_id):
     with st.form("pwd_form"):
-        p1 = st.text_input("新密碼", type="password")
-        p2 = st.text_input("確認", type="password")
-        hint = st.text_input("提示詞")
+        p1 = st.text_input("新密碼", type="password"); p2 = st.text_input("確認", type="password"); hint = st.text_input("提示詞")
         if st.form_submit_button("修改"):
-            if p1 and p1==p2 and hint:
+            if p1==p2 and hint:
                 sys.update_password(user_id, p1, hint, user_role=="admin")
                 st.success("成功"); time.sleep(1); st.session_state.logged_in=False; st.rerun()
             else: st.error("錯誤")
 
-@st.dialog("✍️ 提出交易申請")
-def show_request_dialog(applicant_id, shareholder_list):
-    st.info("請填寫您欲進行的交易")
-    with st.form("req_form"):
-        # 買方/賣方邏輯：假設申請人是賣方 (轉讓給別人)
-        target = st.selectbox("轉讓對象 (買方)", shareholder_list)
-        amount = st.number_input("轉讓股數", min_value=1)
-        
-        if st.form_submit_button("送出申請"):
-            target_id = target.split(" | ")[0]
-            if target_id == applicant_id:
-                st.error("不能轉讓給自己")
-            else:
-                succ, msg = sys.add_request(applicant_id, target_id, amount)
-                if succ: st.success(msg); time.sleep(1.5); st.rerun()
-                else: st.error(msg)
+@st.dialog("✏️ 修改")
+def show_edit_dialog(current_data):
+    with st.form("edit_form"):
+        new_tax_id = st.text_input("統編", value=str(current_data['tax_id']), disabled=True)
+        new_name = st.text_input("姓名", value=current_data['name'])
+        t_opts = ["Individual", "Corporate"]
+        curr_type = current_data['holder_type']
+        t_idx = t_opts.index(curr_type) if curr_type in t_opts else 0
+        new_type = st.selectbox("類別", t_opts, index=t_idx)
+        new_addr = st.text_input("地址", value=str(current_data['address']))
+        new_rep = st.text_input("代表人", value=str(current_data['representative']))
+        new_email = st.text_input("Email", value=str(current_data['email']))
+        new_hint = st.text_input("提示", value=str(current_data['password_hint']))
+        if st.form_submit_button("更新"):
+            succ, msg = sys.upsert_shareholder(new_tax_id, new_name, new_type, new_addr, new_rep, new_email, new_hint)
+            if succ: st.success(msg); time.sleep(1); st.rerun()
 
-@st.dialog("📋 交易審核確認")
-def show_approve_dialog(req_data):
-    st.warning(f"確定核准此交易？")
-    st.write(f"申請人 (賣方): {req_data['applicant']}")
-    st.write(f"對象 (買方): {req_data['target']}")
-    st.write(f"股數: {req_data['amount']}")
-    
-    if st.button("✅ 確認核准"):
-        succ, msg = sys.approve_request(req_data['id'], datetime.today().strftime("%Y-%m-%d"), req_data['applicant'], req_data['target'], req_data['amount'])
-        if succ: st.success(msg); time.sleep(1.5); st.rerun()
+@st.dialog("🗑️ 刪除")
+def show_delete_dialog(tax_id, name):
+    st.warning(f"刪除 {name} ({tax_id})？")
+    if st.button("確認", type="primary"):
+        sys.delete_shareholder(tax_id); st.success("已刪除"); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 批次刪除")
+def show_batch_delete_dialog(selected_list):
+    st.warning(f"刪除 {len(selected_list)} 筆？")
+    st.write(selected_list)
+    if st.button("確認刪除", type="primary"):
+        ids = [i.split(" | ")[0] for i in selected_list]
+        succ, msg = sys.delete_batch_shareholders(ids)
+        if succ:
+            st.success(msg)
+            for k in list(st.session_state.keys()):
+                if k.startswith("sel_"): del st.session_state[k]
+            time.sleep(1.5); st.rerun()
         else: st.error(msg)
 
-# --- Main App ---
-def run_main_app(role, user_name, user_id):
-    with st.sidebar:
-        st.markdown(f"### 👋 {user_name}")
-        if st.button("密碼修改"): show_password_dialog(role, user_id)
-        if st.button("登出"): st.session_state.logged_in = False; st.rerun()
-        
-        if role == "admin":
-            menu_options = ["📊 股東名簿總覽", "✅ 審核交易申請", "📂 批次匯入", "➕ 新增股東", "💰 發行/增資", "🤝 股權過戶", "📝 交易歷史"]
-        else:
-            # 股東選單升級
-            menu_options = ["📝 我的持股", "📜 交易紀錄查詢", "✍️ 申請交易"]
-            
-        menu = st.radio("選單", menu_options)
-
-    st.title("🏢 股務管理系統")
-
-    if role == "admin":
-        if menu == "✅ 審核交易申請":
-            st.header("審核交易申請")
-            df = sys.get_df("requests")
-            if not df.empty and "status" in df.columns:
-                # 只顯示 Pending
-                pending = df[df["status"] == "Pending"]
-                if pending.empty:
-                    st.info("目前無待審核申請")
-                else:
-                    st.dataframe(pending)
-                    st.divider()
-                    st.write("操作區：")
-                    
-                    for i, r in pending.iterrows():
-                        c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
-                        c1.write(f"申請人: {r['applicant']}")
-                        c2.write(f"對象: {r['target']}")
-                        c3.write(f"股數: {r['amount']}")
-                        if c4.button("審核", key=f"appr_{r['id']}"):
-                            show_approve_dialog(r)
-            else:
-                st.info("尚無申請資料")
-
-        # ... (其他 Admin 功能如 股東名簿、批次匯入 等保持不變，省略以節省篇幅) ...
-        elif menu == "📊 股東名簿總覽":
-            df = sys.get_df("shareholders")
-            st.dataframe(df) # 簡化顯示，完整版請貼回之前的代碼
-        elif menu == "📝 交易歷史":
-            st.dataframe(sys.get_df("transactions"))
-        
-        # Admin 也可手動過戶
-        elif menu == "🤝 股權過戶":
-            df = sys.get_df("shareholders")
-            ops = [f"{r['tax_id']} | {r['name']}" for i,r in df.iterrows()]
-            s = st.selectbox("賣方", ops); b = st.selectbox("買方", ops)
-            amt = st.number_input("股數", min_value=1)
-            if st.button("過戶"):
-                msg = sys.transfer_shares(datetime.today(), s.split(" | ")[0], b.split(" | ")[0], amt, "Admin手動")
-                st.success(msg) if "成功" in msg else st.error(msg)
-
-    else:
-        # === 股東功能區 ===
-        if menu == "📝 我的持股":
-            st.header(f"我的持股 - {user_name}")
-            df = sys.get_df("shareholders")
-            r = df[df['tax_id'].astype(str) == str(user_id)]
-            if not r.empty:
-                row = r.iloc[0]
-                c1, c2, c3 = st.columns(3)
-                c1.metric("持有股數", f"{row['shares_held']:,}")
-                c2.metric("Email", row['email'])
-                c3.metric("提示詞", row['password_hint'])
-            else: st.warning("查無資料")
-
-        elif menu == "📜 交易紀錄查詢":
-            st.header("歷史交易明細")
-            df_trans = sys.get_df("transactions")
-            if not df_trans.empty:
-                # 篩選：賣方是我 OR 買方是我
-                # 欄位順序: date, seller, buyer, amount, reason
-                # 假設 Google Sheet 標題為英文，若為中文需調整
-                # 這裡假設欄位名為: date, seller_tax_id, buyer_tax_id, ...
-                try:
-                    my_trans = df_trans[
-                        (df_trans['seller_tax_id'].astype(str) == str(user_id)) | 
-                        (df_trans['buyer_tax_id'].astype(str) == str(user_id))
-                    ]
-                    if not my_trans.empty:
-                        st.dataframe(my_trans, use_container_width=True)
-                    else:
-                        st.info("目前尚無交易紀錄")
-                except:
-                    st.error("讀取紀錄發生錯誤，請確認交易紀錄表標題是否正確 (date, seller_tax_id, buyer_tax_id, amount, reason)")
-            else:
-                st.info("尚無任何交易紀錄")
-
-        elif menu == "✍️ 申請交易":
-            st.header("提出股份轉讓申請")
-            st.info("此申請送出後，需經由管理員審核通過才會生效。")
-            
-            # 取得所有股東名單供選擇 (排除自己)
-            df_users = sys.get_df("shareholders")
-            if not df_users.empty:
-                others = df_users[df_users['tax_id'].astype(str) != str(user_id)]
-                if not others.empty:
-                    target_list = [f"{r['tax_id']} | {r['name']}" for i, r in others.iterrows()]
-                    
-                    if st.button("填寫申請單"):
-                        show_request_dialog(user_id, target_list)
-                    
-                    # 顯示我的申請狀態
-                    st.divider()
-                    st.subheader("我的申請進度")
-                    df_req = sys.get_df("requests")
-                    if not df_req.empty and "applicant" in df_req.columns:
-                        my_reqs = df_req[df_req['applicant'].astype(str) == str(user_id)]
-                        st.dataframe(my_reqs)
-                else:
-                    st.warning("系統中無其他股東可轉讓")
-
-if __name__ == "__main__":
-    if 'logged_in' not in st.session_state:
-        st.session_state.logged_in = False
-        st.session_state.user_role = None; st.session_state.user_name = None; st.session_state.user_id = None
-
-    if not st.session_state.logged_in:
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c2:
-            st.markdown("## 🔒 登入")
-            acc = st.text_input("帳號")
-            pwd = st.text_input("密碼", type="password")
-            if st.button("登入", type="primary", use_container_width=True):
-                if acc == "admin":
-                    v, m, h = sys.verify_login(acc, pwd, True)
-                    if v: st.session_state.logged_in=True; st.session_state.user_role="admin"; st.session_state.user_name=m; st.session_state.user_id=acc; st.rerun()
-                    else: st.error(m)
-                else:
-                    v, m, h = sys.verify_login(acc, pwd, False)
-                    if v: st.session_state.logged_in=True; st.session_state.user_role="shareholder"; st.session_state.user_name=m; st.session_state.user_id=acc; st.rerun()
-                    else: 
-                        st.error(m)
-                        if h: st.info(f"提示: {h}")
-    else:
-        run_main_app(st.session_state.user_role, st.session_state.user_name, st.session_state.user_id)
+@st.dialog("✍️ 申請交易")
+def show_request_dialog(applicant_id, shareholder_list):
+    st.info("填寫申請單")
+    with st.form("req_form"):
+        target = st.selectbox("轉讓對象", shareholder_list)
+        amount = st.numbe
