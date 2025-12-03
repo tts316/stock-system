@@ -323,4 +323,206 @@ def show_request_dialog(applicant_id, shareholder_list):
     st.info("填寫申請單")
     with st.form("req_form"):
         target = st.selectbox("轉讓對象", shareholder_list)
-        amount = st.numbe
+        amount = st.number_input("股數", min_value=1)
+        if st.form_submit_button("送出"):
+            tid = target.split(" | ")[0]
+            if tid == applicant_id: st.error("不能轉給自己")
+            else:
+                succ, msg = sys.add_request(applicant_id, tid, amount)
+                if succ: st.success(msg); time.sleep(1.5); st.rerun()
+                else: st.error(msg)
+
+@st.dialog("📋 審核確認")
+def show_approve_dialog(req_data):
+    st.warning("核准此交易？")
+    st.write(f"賣方: {req_data['applicant']}"); st.write(f"買方: {req_data['target']}"); st.write(f"股數: {req_data['amount']}")
+    if st.button("✅ 核准"):
+        succ, msg = sys.approve_request(req_data['id'], datetime.today().strftime("%Y-%m-%d"), req_data['applicant'], req_data['target'], req_data['amount'])
+        if succ: st.success(msg); time.sleep(1.5); st.rerun()
+        else: st.error(msg)
+
+# --- Main App ---
+def run_main_app(role, user_name, user_id):
+    with st.sidebar:
+        st.markdown(f"### 👋 {user_name}")
+        if st.button("密碼修改"): show_password_dialog(role, user_id)
+        if st.button("登出"): st.session_state.logged_in = False; st.rerun()
+        
+        if role == "admin":
+            menu_options = ["📊 股東名簿總覽", "✅ 審核交易申請", "📂 批次匯入", "➕ 新增股東", "💰 發行/增資", "🤝 股權過戶", "📝 交易歷史"]
+        else:
+            menu_options = ["📝 我的持股", "📜 交易紀錄查詢", "✍️ 申請交易"]
+        menu = st.radio("選單", menu_options)
+
+    st.title("🏢 股務管理系統")
+
+    if role == "admin":
+        if menu == "📊 股東名簿總覽":
+            st.header("股東名簿")
+            df = sys.get_df("shareholders")
+            if not df.empty:
+                c1, c2 = st.columns(2)
+                c1.metric("人數", len(df)); c2.metric("股數", f"{df['shares_held'].sum():,}")
+                search = st.text_input("搜尋")
+                if search: df = df[df['name'].astype(str).str.contains(search) | df['tax_id'].astype(str).str.contains(search)]
+                
+                # Batch Delete
+                def toggle_all():
+                    val = st.session_state.master_select
+                    for t in df['tax_id']: st.session_state[f"sel_{t}"] = val
+                sel_ids = []
+                for t in df['tax_id']:
+                    if st.session_state.get(f"sel_{t}", False):
+                        n = df[df['tax_id']==t].iloc[0]['name']
+                        sel_ids.append(f"{t} | {n}")
+                
+                c1, c2 = st.columns([1,4])
+                c1.checkbox("全選", key="master_select", on_change=toggle_all)
+                if sel_ids: 
+                    if c2.button(f"刪除選取 ({len(sel_ids)})"): show_batch_delete_dialog(sel_ids)
+
+                cols = [0.5, 1.5, 1.5, 2, 1, 2]
+                h = st.columns(cols)
+                h[1].write("統編"); h[2].write("姓名"); h[3].write("Email"); h[4].write("股數"); h[5].write("操作")
+                st.divider()
+                for i, r in df.iterrows():
+                    with st.container():
+                        c = st.columns(cols, vertical_alignment="center")
+                        c[0].checkbox("選取", key=f"sel_{r['tax_id']}", label_visibility="collapsed")
+                        c[1].write(str(r['tax_id'])); c[2].write(r['name']); c[3].write(r['email']); c[4].write(f"{r['shares_held']:,}")
+                        with c[5]:
+                            b1, b2 = st.columns(2)
+                            if b1.button("✏️", key=f"e_{r['tax_id']}"): show_edit_dialog(r)
+                            if b2.button("🗑️", key=f"d_{r['tax_id']}"): show_delete_dialog(r['tax_id'], r['name'])
+                    st.markdown("---")
+            else: st.info("無資料")
+
+        elif menu == "📂 批次匯入":
+            st.header("批次匯入")
+            replace = st.checkbox("⚠️ 覆寫持股數")
+            sample = pd.DataFrame(columns=["身分證或統編", "姓名", "身分別", "地址", "代表人", "持股數", "Email", "密碼提示"])
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer: sample.to_excel(writer, index=False)
+            st.download_button("下載範本", buf, "template.xlsx")
+            up = st.file_uploader("上傳 Excel", type=["xlsx"])
+            if up and st.button("確認匯入"):
+                try:
+                    df_up = pd.read_excel(up)
+                    succ, msg = sys.batch_import_from_excel(df_up, replace)
+                    if succ: st.success(msg); time.sleep(2); st.rerun()
+                    else: st.error(msg)
+                except Exception as e: st.error(str(e))
+
+        elif menu == "✅ 審核交易申請":
+            st.header("審核交易")
+            df = sys.get_df("requests")
+            if not df.empty and "status" in df.columns:
+                pending = df[df["status"] == "Pending"]
+                if pending.empty: st.info("無待審核")
+                else:
+                    st.dataframe(pending); st.divider()
+                    for i, r in pending.iterrows():
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.write(f"賣: {r['applicant']}"); c2.write(f"買: {r['target']}"); c3.write(f"股: {r['amount']}")
+                        if c4.button("審核", key=f"ap_{r['id']}"): show_approve_dialog(r)
+            else: st.info("無申請資料")
+
+        elif menu == "➕ 新增股東":
+            with st.form("add"):
+                c1, c2 = st.columns(2)
+                tid = c1.text_input("統編"); nm = c2.text_input("姓名")
+                tp = st.selectbox("類別", ["Individual", "Corporate"])
+                addr = st.text_input("地址"); rep = st.text_input("代表人")
+                email = st.text_input("Email"); hint = st.text_input("提示")
+                if st.form_submit_button("儲存"):
+                    if tid and nm:
+                        sys.upsert_shareholder(tid, nm, tp, addr, rep, email, hint)
+                        st.success("成功"); time.sleep(1); st.rerun()
+                    else: st.error("缺資料")
+
+        elif menu == "💰 發行/增資":
+            df = sys.get_df("shareholders")
+            if not df.empty:
+                ops = [f"{r['tax_id']} | {r['name']}" for i,r in df.iterrows()]
+                tgt = st.selectbox("對象", ops); amt = st.number_input("股數", min_value=1)
+                if st.button("發行"):
+                    sys.issue_shares(tgt.split(" | ")[0], amt); st.success("成功")
+            else: st.warning("無資料")
+
+        elif menu == "🤝 股權過戶":
+            df = sys.get_df("shareholders")
+            if len(df)>=2:
+                ops = [f"{r['tax_id']} | {r['name']}" for i,r in df.iterrows()]
+                s = st.selectbox("賣方", ops); b = st.selectbox("買方", ops)
+                amt = st.number_input("股數", min_value=1)
+                if st.button("過戶"):
+                    msg = sys.transfer_shares(datetime.today(), s.split(" | ")[0], b.split(" | ")[0], amt, "Admin手動")
+                    st.success(msg) if "成功" in msg else st.error(msg)
+            else: st.warning("人數不足")
+
+        elif menu == "📝 交易歷史":
+            st.dataframe(sys.get_df("transactions"), use_container_width=True)
+
+    else:
+        # 股東功能
+        if menu == "📝 我的持股":
+            st.header(f"持股 - {user_name}")
+            df = sys.get_df("shareholders")
+            r = df[df['tax_id'].astype(str)==str(user_id)]
+            if not r.empty:
+                row = r.iloc[0]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("股數", f"{row['shares_held']:,}")
+                c2.metric("Email", row['email'])
+                c3.metric("提示", row['password_hint'])
+                st.info(f"統編: {row['tax_id']}")
+                st.text_input("地址", value=row['address'], disabled=True)
+            else: st.warning("無資料")
+        
+        elif menu == "📜 交易紀錄查詢":
+            st.header("交易紀錄")
+            df = sys.get_df("transactions")
+            if not df.empty:
+                my = df[(df['seller_tax_id'].astype(str)==str(user_id)) | (df['buyer_tax_id'].astype(str)==str(user_id))]
+                st.dataframe(my) if not my.empty else st.info("無紀錄")
+            else: st.info("無紀錄")
+
+        elif menu == "✍️ 申請交易":
+            st.header("申請轉讓")
+            df = sys.get_df("shareholders")
+            others = df[df['tax_id'].astype(str)!=str(user_id)]
+            if not others.empty:
+                ops = [f"{r['tax_id']} | {r['name']}" for i,r in others.iterrows()]
+                if st.button("填寫申請單"): show_request_dialog(user_id, ops)
+                st.divider(); st.subheader("我的申請")
+                reqs = sys.get_df("requests")
+                if not reqs.empty and "applicant" in reqs.columns:
+                    st.dataframe(reqs[reqs['applicant'].astype(str)==str(user_id)])
+            else: st.warning("無對象")
+
+if __name__ == "__main__":
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+        st.session_state.user_role = None; st.session_state.user_name = None; st.session_state.user_id = None
+
+    if not st.session_state.logged_in:
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            st.markdown("## 🔒 登入")
+            acc = st.text_input("帳號")
+            pwd = st.text_input("密碼", type="password")
+            c1, c2 = st.columns(2)
+            if c1.button("登入", type="primary", use_container_width=True):
+                if acc=="admin":
+                    v, m, h = sys.verify_login(acc, pwd, True)
+                    if v: st.session_state.logged_in=True; st.session_state.user_role="admin"; st.session_state.user_name=m; st.session_state.user_id=acc; st.rerun()
+                    else: st.error(m)
+                else:
+                    v, m, h = sys.verify_login(acc, pwd, False)
+                    if v: st.session_state.logged_in=True; st.session_state.user_role="shareholder"; st.session_state.user_name=m; st.session_state.user_id=acc; st.rerun()
+                    else: 
+                        st.error(m)
+                        if h: st.info(f"提示: {h}")
+            if c2.button("忘記密碼", use_container_width=True): show_forgot_password_dialog()
+    else:
+        run_main_app(st.session_state.user_role, st.session_state.user_name, st.session_state.user_id)
