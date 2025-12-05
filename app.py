@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 # --- 1. 系統設定區 ---
-st.set_page_config(page_title="股務管理系統 (修正版)", layout="wide")
+st.set_page_config(page_title="股務管理系統 (穩定版)", layout="wide")
 
 # Email 設定
 SMTP_SERVER = "smtp.gmail.com"
@@ -52,7 +52,6 @@ class GoogleSheetDB:
             except APIError: time.sleep(1)
         return pd.DataFrame()
 
-    # --- 申請單邏輯 ---
     def add_request(self, applicant_id, amount, reason):
         try:
             cell_sh = self.ws_shareholders.find(applicant_id, in_column=1)
@@ -72,7 +71,6 @@ class GoogleSheetDB:
 
             req_id = int(time.time())
             date_str = datetime.now().strftime("%Y-%m-%d")
-            # id, date, applicant, target, amount, status, reason, reject_reason
             self.ws_requests.append_row([req_id, date_str, applicant_id, "", amount, "Pending", reason, ""])
             return True, "申請已送出，待管理員審核。"
         except Exception as e: return False, str(e)
@@ -110,7 +108,6 @@ class GoogleSheetDB:
             return False, "找不到該申請單"
         except Exception as e: return False, str(e)
 
-    # --- 批次匯入 (極速版) ---
     def batch_import_from_excel(self, df_excel, replace_shares=False):
         try:
             current_records = self.ws_shareholders.get_all_records()
@@ -153,7 +150,6 @@ class GoogleSheetDB:
             return True, f"處理完成！共 {updated_count} 筆。"
         except Exception as e: return False, f"匯入失敗: {str(e)}"
 
-    # --- 基本功能 ---
     def upsert_shareholder(self, tax_id, name, holder_type, address, representative, email, hint):
         try:
             tax_id = str(tax_id).strip()
@@ -224,6 +220,12 @@ class GoogleSheetDB:
                 row = cell.row
                 curr = int(self.ws_shareholders.cell(row, 8).value or 0)
                 self.ws_shareholders.update_cell(row, 8, curr + amount)
+        except: pass
+
+    def set_share_count(self, tax_id, amount):
+        try:
+            cell = self.ws_shareholders.find(tax_id, in_column=1)
+            if cell: self.ws_shareholders.update_cell(cell.row, 8, amount)
         except: pass
 
     def delete_shareholder(self, tax_id):
@@ -301,10 +303,45 @@ def show_password_dialog(user_role, user_id):
                 st.success("成功"); time.sleep(1); st.session_state.logged_in=False; st.rerun()
             else: st.error("錯誤")
 
-# --- 修正後的申請視窗 ---
+@st.dialog("✏️ 修改")
+def show_edit_dialog(current_data):
+    with st.form("edit_form"):
+        new_tax_id = st.text_input("統編", value=str(current_data['tax_id']), disabled=True)
+        new_name = st.text_input("姓名", value=current_data['name'])
+        t_opts = ["Individual", "Corporate"]
+        curr_type = current_data['holder_type']
+        t_idx = t_opts.index(curr_type) if curr_type in t_opts else 0
+        new_type = st.selectbox("類別", t_opts, index=t_idx)
+        new_addr = st.text_input("地址", value=str(current_data['address']))
+        new_rep = st.text_input("代表人", value=str(current_data['representative']))
+        new_email = st.text_input("Email", value=str(current_data['email']))
+        new_hint = st.text_input("提示", value=str(current_data['password_hint']))
+        if st.form_submit_button("更新"):
+            succ, msg = sys.upsert_shareholder(new_tax_id, new_name, new_type, new_addr, new_rep, new_email, new_hint)
+            if succ: st.success(msg); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 刪除")
+def show_delete_dialog(tax_id, name):
+    st.warning(f"刪除 {name} ({tax_id})？")
+    if st.button("確認", type="primary"):
+        sys.delete_shareholder(tax_id); st.success("已刪除"); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 批次刪除")
+def show_batch_delete_dialog(selected_list):
+    st.warning(f"刪除 {len(selected_list)} 筆？")
+    st.write(selected_list)
+    if st.button("確認刪除", type="primary"):
+        ids = [i.split(" | ")[0] for i in selected_list]
+        succ, msg = sys.delete_batch_shareholders(ids)
+        if succ:
+            st.success(msg)
+            for k in list(st.session_state.keys()):
+                if k.startswith("sel_"): del st.session_state[k]
+            time.sleep(1.5); st.rerun()
+        else: st.error(msg)
+
 @st.dialog("✍️ 提出交易申請")
 def show_request_dialog(applicant_id, current_shares, pending_shares):
-    # 修正重點：變數名稱與上方計算一致
     st.info(f"目前持有: {current_shares:,} 股 | 申請中: {pending_shares:,} 股")
     available = current_shares - pending_shares
     st.success(f"可用交易股數: {available:,} 股")
@@ -333,10 +370,8 @@ def show_approve_dialog(req_data, shareholder_list):
     st.write(f"申請原因: {req_data['reason']}")
     
     with st.form("approve_form"):
-        # 排除賣方自己
         options = [x for x in shareholder_list if x.split(" | ")[0] != str(req_data['applicant'])]
         target = st.selectbox("選擇買方 (受讓人)", options)
-        
         if st.form_submit_button("✅ 確認過戶"):
             target_id = target.split(" | ")[0]
             succ, msg = sys.approve_request(req_data['id'], datetime.today().strftime("%Y-%m-%d"), req_data['applicant'], target_id, req_data['amount'])
@@ -347,7 +382,7 @@ def show_approve_dialog(req_data, shareholder_list):
 def show_reject_dialog(req_id):
     st.warning("您即將退回此申請")
     with st.form("reject_form"):
-        reason = st.text_input("退件原因 (必填)", placeholder="例如：資料不符、暫停交易...")
+        reason = st.text_input("退件原因 (必填)")
         if st.form_submit_button("確認退件"):
             if not reason: st.error("請填寫原因")
             else:
@@ -388,22 +423,17 @@ def run_main_app(role, user_name, user_id):
                 else:
                     st.dataframe(pending)
                     st.divider()
-                    
                     df_users = sys.get_df("shareholders")
                     user_list = [f"{r['tax_id']} | {r['name']}" for i,r in df_users.iterrows()]
-                    
                     for i, r in pending.iterrows():
                         with st.container():
                             c1, c2, c3, c4 = st.columns([2, 1, 2, 2])
                             c1.write(f"申請人: {r['applicant']}")
                             c2.write(f"股數: {r['amount']}")
                             c3.write(f"原因: {r.get('reason', '')}")
-                            
                             b_col1, b_col2 = c4.columns(2)
-                            if b_col1.button("核准", key=f"ok_{r['id']}"):
-                                show_approve_dialog(r, user_list)
-                            if b_col2.button("退件", key=f"no_{r['id']}"):
-                                show_reject_dialog(r['id'])
+                            if b_col1.button("核准", key=f"ok_{r['id']}"): show_approve_dialog(r, user_list)
+                            if b_col2.button("退件", key=f"no_{r['id']}"): show_reject_dialog(r['id'])
                         st.markdown("---")
             else: st.info("無申請資料")
 
@@ -468,11 +498,12 @@ def run_main_app(role, user_name, user_id):
             else: st.warning("無資料")
         
         elif menu == "📜 交易紀錄查詢":
-            st.header("交易紀錄")
+            st.header("歷史交易明細")
             df = sys.get_df("transactions")
             if not df.empty:
                 my = df[(df['seller_tax_id'].astype(str)==str(user_id)) | (df['buyer_tax_id'].astype(str)==str(user_id))]
-                st.dataframe(my) if not my.empty else st.info("無紀錄")
+                if not my.empty: st.dataframe(my)
+                else: st.info("無紀錄")
             else: st.info("無紀錄")
 
         elif menu == "✍️ 申請交易":
