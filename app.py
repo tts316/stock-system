@@ -14,7 +14,7 @@ from gspread.exceptions import APIError
 import re
 
 # --- 1. 系統設定區 ---
-st.set_page_config(page_title="股務管理系統 (全功能旗艦版)", layout="wide")
+st.set_page_config(page_title="股務管理系統 (除錯修正版)", layout="wide")
 
 # Email 設定
 SMTP_SERVER = "smtp.gmail.com"
@@ -29,7 +29,6 @@ class GoogleServices:
 
     def connect(self):
         try:
-            # 定義權限 Scope (包含 Sheet, Drive, Cloud Platform)
             scope = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
@@ -38,7 +37,6 @@ class GoogleServices:
             creds_dict = dict(st.secrets["gcp_service_account"])
             self.creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
             
-            # 1. Sheet 連線
             self.gc = gspread.authorize(self.creds)
             sheet_url = st.secrets["sheet_config"]["spreadsheet_url"]
             self.sh = self.gc.open_by_url(sheet_url)
@@ -46,15 +44,10 @@ class GoogleServices:
             self.ws_tx = self.sh.worksheet("transactions")
             self.ws_adm = self.sh.worksheet("system_admin")
             self.ws_req = self.sh.worksheet("requests")
-            
-            # 嘗試連線 logs 分頁，若無則忽略 (相容舊版)
             try: self.ws_log = self.sh.worksheet("change_logs")
             except: self.ws_log = None
 
-            # 2. Drive 連線 (存圖用)
             self.drive_service = build('drive', 'v3', credentials=self.creds)
-
-            # 3. Vision 連線 (OCR用)
             self.vision_client = vision.ImageAnnotatorClient(credentials=self.creds)
 
         except Exception as e:
@@ -64,12 +57,19 @@ class GoogleServices:
     def get_df(self, table_name):
         for i in range(3):
             try:
+                data = []
                 if table_name == "shareholders": data = self.ws_sh.get_all_records()
                 elif table_name == "transactions": data = self.ws_tx.get_all_records()
                 elif table_name == "requests": data = self.ws_req.get_all_records()
                 elif table_name == "logs" and self.ws_log: data = self.ws_log.get_all_records()
-                else: return pd.DataFrame()
-                return pd.DataFrame(data)
+                
+                df = pd.DataFrame(data)
+                
+                # [關鍵修正]：自動去除欄位名稱的前後空白
+                if not df.empty:
+                    df.columns = df.columns.str.strip()
+                
+                return df
             except APIError: time.sleep(1)
         return pd.DataFrame()
 
@@ -121,13 +121,14 @@ class GoogleServices:
             cell = self.ws_sh.find(tax_id, in_column=1)
             if not cell: return False, "找不到資料"
             headers = self.ws_sh.row_values(1)
+            # 清理 Header 空白
+            headers = [h.strip() for h in headers]
+            
             old_row = self.ws_sh.row_values(cell.row)
             while len(old_row) < len(headers): old_row.append("")
             current_data = dict(zip(headers, old_row))
             changes = []
             
-            # 欄位對應 (確保 Sheet 有這些欄位)
-            # 假設 Sheet 欄位已更新為: tax_id, name, holder_type, representative, household_address, mailing_address, phone, email, password_hint, shares_held, password, id_image_url
             for key, val in new_data.items():
                 if key in headers:
                     new_val = str(val)
@@ -143,7 +144,7 @@ class GoogleServices:
             return True, "無變更"
         except Exception as e: return False, str(e)
 
-    # --- 核心交易與管理功能 (補回) ---
+    # --- 核心交易與管理功能 ---
     def batch_import_from_excel(self, df_excel, replace_shares=False):
         try:
             current = self.ws_sh.get_all_records()
@@ -152,12 +153,10 @@ class GoogleServices:
             for i, row in df_excel.iterrows():
                 tid = str(row.get("身分證或統編", "")).strip()
                 if not tid: continue
-                # 建立基本資料 dict
                 new_info = {
                     'name': str(row.get("姓名", "")).strip(),
                     'holder_type': "Corporate" if "法人" in str(row.get("身分別", "")) else "Individual",
                     'representative': str(row.get("代表人", "")),
-                    # 兼容舊版地址欄位
                     'household_address': str(row.get("戶籍地址", row.get("地址", ""))),
                     'mailing_address': str(row.get("通訊地址", row.get("地址", ""))),
                     'email': str(row.get("Email", "")),
@@ -178,9 +177,7 @@ class GoogleServices:
                     db_map[tid] = new_info
                 cnt += 1
             
-            # 寫回
             final_data = []
-            # 定義完整的 Header 順序 (必須與 Google Sheet 一致)
             headers = ["tax_id", "name", "holder_type", "representative", "household_address", "mailing_address", "phone", "email", "password_hint", "shares_held", "password", "id_image_url"]
             
             for k, v in db_map.items():
@@ -205,7 +202,6 @@ class GoogleServices:
             if amount > (curr - pending): return False, "可用股數不足"
             
             rid = int(time.time())
-            # id, date, applicant, target, amount, status, reason, reject_reason
             self.ws_req.append_row([rid, datetime.now().strftime("%Y-%m-%d"), applicant_id, "", amount, "Pending", reason, ""])
             return True, "已送出"
         except Exception as e: return False, str(e)
@@ -244,7 +240,6 @@ class GoogleServices:
             b_cell = self.ws_sh.find(b_id, in_column=1)
             if not s_cell or not b_cell: return False, "找不到買賣方"
             
-            # Col 10 is shares
             s_shares = int(self.ws_sh.cell(s_cell.row, 10).value or 0)
             b_shares = int(self.ws_sh.cell(b_cell.row, 10).value or 0)
             
@@ -257,16 +252,15 @@ class GoogleServices:
         except Exception as e: return False, str(e)
 
     def upsert_shareholder(self, tax_id, name, holder_type, address, representative, email, hint):
-        # 簡易新增 (配合 Admin 手動新增功能)
         try:
             tax_id = str(tax_id).strip()
+            if not hint: hint = "無提示"
             try: cell = self.ws_sh.find(tax_id)
             except: time.sleep(1); cell = self.ws_sh.find(tax_id)
             
-            # 這裡簡單處理，若要完整欄位建議用 update_shareholder_profile
             row_data = [tax_id, name, holder_type, representative, address, address, "", email, hint, 0, "", ""]
             
-            if cell: return False, "股東已存在，請使用編輯功能"
+            if cell: return False, "股東已存在"
             else: self.ws_sh.append_row(row_data)
             return True, "新增成功"
         except Exception as e: return False, str(e)
@@ -274,7 +268,6 @@ class GoogleServices:
     def issue_shares(self, tax_id, amount):
         try:
             cell = self.ws_sh.find(tax_id, in_column=1)
-            # Col 10
             curr = int(self.ws_sh.cell(cell.row, 10).value or 0)
             self.ws_sh.update_cell(cell.row, 10, curr + amount)
         except: pass
@@ -324,8 +317,6 @@ class GoogleServices:
                     hint = row_vals[3] if len(row_vals)>3 else ""
                     pwd = row_vals[1]
                 else:
-                    # New structure: email is col 8 (index 7), hint col 9 (index 8), pass col 11 (index 10)
-                    # Python list index starts at 0
                     email = row_vals[7] if len(row_vals)>7 else ""
                     hint = row_vals[8] if len(row_vals)>8 else ""
                     pwd = row_vals[10] if len(row_vals)>10 and row_vals[10]!="" else user_id
@@ -419,12 +410,10 @@ def show_reject_dialog(req_id):
             else: st.error(m)
 
 def send_recovery_email(to, uid, pwd):
-    # 省略實作細節，與前版相同
     return True, "已發送"
 
 @st.dialog("🔑 忘記密碼")
 def show_forgot_password_dialog():
-    # 省略，與前版相同
     u = st.text_input("帳號")
     if st.button("查詢"):
         i = sys.get_user_recovery_info(u, u=="admin")
@@ -446,7 +435,6 @@ def run_main_app(role, user_name, user_id):
         if st.button("登出"): st.session_state.logged_in=False; st.rerun()
         
         if role == "admin":
-            # 這裡確保所有 Admin 功能都列出來
             menu = st.radio("選單", ["📊 股東名簿總覽", "✅ 審核交易申請", "📂 批次匯入", "➕ 新增股東", "💰 發行/增資", "🤝 股權過戶", "📝 交易歷史", "📝 修改紀錄查詢"])
         else:
             menu = st.radio("選單", ["👤 個人資料維護", "📝 我的持股", "📜 交易紀錄查詢", "✍️ 申請交易"])
@@ -456,8 +444,13 @@ def run_main_app(role, user_name, user_id):
     if role == "admin":
         if menu == "📊 股東名簿總覽":
             df = sys.get_df("shareholders")
-            st.metric("總股數", f"{df['shares_held'].sum():,}")
-            st.dataframe(df) # 完整版可加回勾選刪除邏輯
+            # [關鍵修正]: 確保欄位為數字且安全顯示
+            if not df.empty and 'shares_held' in df.columns:
+                total_shares = pd.to_numeric(df['shares_held'], errors='coerce').fillna(0).sum()
+                st.metric("總股數", f"{total_shares:,}")
+                st.dataframe(df)
+            else: st.info("無資料")
+            
         elif menu == "✅ 審核交易申請":
             df = sys.get_df("requests")
             if not df.empty and "status" in df.columns:
@@ -511,7 +504,6 @@ def run_main_app(role, user_name, user_id):
             else: st.info("無紀錄")
 
     else:
-        # 股東
         if menu == "👤 個人資料維護":
             my = sys.get_shareholder_detail(user_id)
             if my:
