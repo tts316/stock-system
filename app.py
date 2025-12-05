@@ -434,8 +434,10 @@ def run_main_app(role, user_name, user_id):
             up = st.file_uploader("上傳 Excel", type=["xlsx"])
             if up and st.button("確認匯入"):
                 try:
-                    succ, msg = sys.batch_import_from_excel(pd.read_excel(up), replace)
-                    st.success(msg) if succ else st.error(msg)
+                    df_up = pd.read_excel(up)
+                    succ, msg = sys.batch_import_from_excel(df_up, replace)
+                    if succ: st.success(msg); time.sleep(2); st.rerun()
+                    else: st.error(msg)
                 except Exception as e: st.error(str(e))
         elif menu == "➕ 新增股東":
             with st.form("add"):
@@ -449,17 +451,20 @@ def run_main_app(role, user_name, user_id):
             df = sys.get_df("shareholders")
             ops = [f"{r['tax_id']} | {r['name']}" for i,r in df.iterrows()]
             tgt = st.selectbox("對象", ops); amt = st.number_input("股數", min_value=1)
-            if st.button("發行"): sys.issue_shares(tgt.split(" | ")[0], amt); st.success("成功")
+            if st.button("發行"):
+                sys.issue_shares(tgt.split(" | ")[0], amt); st.success("成功")
         elif menu == "🤝 股權過戶":
             df = sys.get_df("shareholders")
             ops = [f"{r['tax_id']} | {r['name']}" for i,r in df.iterrows()]
             s = st.selectbox("賣方", ops); b = st.selectbox("買方", ops); amt = st.number_input("股數", min_value=1)
-            if st.button("過戶"): sys.transfer_shares(datetime.today(), s.split(" | ")[0], b.split(" | ")[0], amt, "Admin手動"); st.success("成功")
+            if st.button("過戶"):
+                msg = sys.transfer_shares(datetime.today(), s.split(" | ")[0], b.split(" | ")[0], amt, "Admin手動")
+                st.success(msg) if "成功" in msg else st.error(msg)
         elif menu == "📝 交易歷史":
-            st.dataframe(sys.get_df("transactions"))
+            st.dataframe(sys.get_df("transactions"), use_container_width=True)
 
     else:
-        # === 股東功能 ===
+        # 股東功能
         if menu == "📝 我的持股":
             st.header(f"持股 - {user_name}")
             df = sys.get_df("shareholders")
@@ -467,13 +472,15 @@ def run_main_app(role, user_name, user_id):
             if not r.empty:
                 row = r.iloc[0]
                 c1, c2, c3 = st.columns(3)
-                c1.metric("持有股數", f"{row['shares_held']:,}")
+                c1.metric("股數", f"{row['shares_held']:,}")
                 c2.metric("Email", row['email'])
-                c3.metric("提示詞", row['password_hint'])
-            else: st.warning("查無資料")
-
+                c3.metric("提示", row['password_hint'])
+                st.info(f"統編: {row['tax_id']}")
+                st.text_input("地址", value=row['address'], disabled=True)
+            else: st.warning("無資料")
+        
         elif menu == "📜 交易紀錄查詢":
-            st.header("歷史交易明細")
+            st.header("交易紀錄")
             df = sys.get_df("transactions")
             if not df.empty:
                 my = df[(df['seller_tax_id'].astype(str)==str(user_id)) | (df['buyer_tax_id'].astype(str)==str(user_id))]
@@ -481,7 +488,7 @@ def run_main_app(role, user_name, user_id):
             else: st.info("無紀錄")
 
         elif menu == "✍️ 申請交易":
-            st.header("提出交易申請")
+            st.header("申請轉讓")
             
             # 1. 取得基本資料
             df_sh = sys.get_df("shareholders")
