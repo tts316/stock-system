@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 # --- 1. 系統設定區 ---
-st.set_page_config(page_title="股務管理系統 (交易審核嚴謹版)", layout="wide")
+st.set_page_config(page_title="股務管理系統 (修正版)", layout="wide")
 
 # Email 設定
 SMTP_SERVER = "smtp.gmail.com"
@@ -52,32 +52,27 @@ class GoogleSheetDB:
             except APIError: time.sleep(1)
         return pd.DataFrame()
 
-    # --- 申請單邏輯 (大幅修改) ---
+    # --- 申請單邏輯 ---
     def add_request(self, applicant_id, amount, reason):
         try:
-            # 1. 檢查持股數
             cell_sh = self.ws_shareholders.find(applicant_id, in_column=1)
             if not cell_sh: return False, "找不到股東資料"
             current_shares = int(self.ws_shareholders.cell(cell_sh.row, 8).value or 0)
 
-            # 2. 檢查「申請中但未核准」的股數 (防呆機制)
             req_data = self.ws_requests.get_all_records()
             pending_shares = 0
             for r in req_data:
-                # 確保欄位存在且狀態為 Pending 且申請人是自己
                 if str(r.get('applicant')) == str(applicant_id) and r.get('status') == 'Pending':
                     pending_shares += int(r.get('amount') or 0)
             
-            # 3. 計算可用餘額
             available_shares = current_shares - pending_shares
             
             if amount > available_shares:
-                return False, f"股數不足！\n目前持股: {current_shares}\n申請中扣除: {pending_shares}\n可用於交易: {available_shares}"
+                return False, f"股數不足！(持有: {current_shares}, 凍結: {pending_shares}, 可用: {available_shares})"
 
-            # 4. 寫入申請 (target 留空)
             req_id = int(time.time())
             date_str = datetime.now().strftime("%Y-%m-%d")
-            # 順序: id, date, applicant, target(空), amount, status, reason, reject_reason(空)
+            # id, date, applicant, target, amount, status, reason, reject_reason
             self.ws_requests.append_row([req_id, date_str, applicant_id, "", amount, "Pending", reason, ""])
             return True, "申請已送出，待管理員審核。"
         except Exception as e: return False, str(e)
@@ -86,28 +81,22 @@ class GoogleSheetDB:
         try:
             cell = self.ws_requests.find(str(req_id), in_column=1)
             if cell:
-                # 雙重確認狀態是否為 Pending (避免剛好被核准又被刪除)
                 status = self.ws_requests.cell(cell.row, 6).value
                 if status == "Pending":
                     self.ws_requests.delete_rows(cell.row)
                     return True, "申請已撤銷刪除"
-                else:
-                    return False, "該申請已被處理，無法刪除"
+                else: return False, "該申請已被處理，無法刪除"
             return False, "找不到該申請單"
         except Exception as e: return False, str(e)
 
     def approve_request(self, req_id, date, seller_id, buyer_id, amount):
         try:
-            # 1. 執行過戶 (這會檢查賣方實際庫存)
             success, msg = self.transfer_shares(date, seller_id, buyer_id, amount, "股東申請交易")
             if not success: return False, msg
-            
-            # 2. 更新申請單: 填入買方(Col 4), 狀態(Col 6)
             cell = self.ws_requests.find(str(req_id), in_column=1)
             if cell:
-                self.ws_requests.update_cell(cell.row, 4, buyer_id) # Target
-                self.ws_requests.update_cell(cell.row, 6, "Approved") # Status
-            
+                self.ws_requests.update_cell(cell.row, 4, buyer_id)
+                self.ws_requests.update_cell(cell.row, 6, "Approved")
             return True, "審核通過，已完成過戶！"
         except Exception as e: return False, str(e)
 
@@ -115,13 +104,13 @@ class GoogleSheetDB:
         try:
             cell = self.ws_requests.find(str(req_id), in_column=1)
             if cell:
-                self.ws_requests.update_cell(cell.row, 6, "Rejected") # Status
-                self.ws_requests.update_cell(cell.row, 8, reject_reason) # Reject Reason
+                self.ws_requests.update_cell(cell.row, 6, "Rejected")
+                self.ws_requests.update_cell(cell.row, 8, reject_reason)
                 return True, "已駁回申請"
             return False, "找不到該申請單"
         except Exception as e: return False, str(e)
 
-    # --- (以下為維持不變的核心功能) ---
+    # --- 批次匯入 (極速版) ---
     def batch_import_from_excel(self, df_excel, replace_shares=False):
         try:
             current_records = self.ws_shareholders.get_all_records()
@@ -164,6 +153,7 @@ class GoogleSheetDB:
             return True, f"處理完成！共 {updated_count} 筆。"
         except Exception as e: return False, f"匯入失敗: {str(e)}"
 
+    # --- 基本功能 ---
     def upsert_shareholder(self, tax_id, name, holder_type, address, representative, email, hint):
         try:
             tax_id = str(tax_id).strip()
@@ -234,12 +224,6 @@ class GoogleSheetDB:
                 row = cell.row
                 curr = int(self.ws_shareholders.cell(row, 8).value or 0)
                 self.ws_shareholders.update_cell(row, 8, curr + amount)
-        except: pass
-
-    def set_share_count(self, tax_id, amount):
-        try:
-            cell = self.ws_shareholders.find(tax_id, in_column=1)
-            if cell: self.ws_shareholders.update_cell(cell.row, 8, amount)
         except: pass
 
     def delete_shareholder(self, tax_id):
@@ -317,8 +301,10 @@ def show_password_dialog(user_role, user_id):
                 st.success("成功"); time.sleep(1); st.session_state.logged_in=False; st.rerun()
             else: st.error("錯誤")
 
+# --- 修正後的申請視窗 ---
 @st.dialog("✍️ 提出交易申請")
-def show_request_dialog(applicant_id, current_holdings, pending_shares):
+def show_request_dialog(applicant_id, current_shares, pending_shares):
+    # 修正重點：變數名稱與上方計算一致
     st.info(f"目前持有: {current_shares:,} 股 | 申請中: {pending_shares:,} 股")
     available = current_shares - pending_shares
     st.success(f"可用交易股數: {available:,} 股")
@@ -403,7 +389,6 @@ def run_main_app(role, user_name, user_id):
                     st.dataframe(pending)
                     st.divider()
                     
-                    # 取得所有股東名單供核定使用
                     df_users = sys.get_df("shareholders")
                     user_list = [f"{r['tax_id']} | {r['name']}" for i,r in df_users.iterrows()]
                     
@@ -422,10 +407,13 @@ def run_main_app(role, user_name, user_id):
                         st.markdown("---")
             else: st.info("無申請資料")
 
-        # ... (其他 Admin 功能維持原樣，篇幅省略) ...
         elif menu == "📊 股東名簿總覽":
             df = sys.get_df("shareholders")
-            st.dataframe(df) # 簡化顯示，完整版請保留原本邏輯
+            if not df.empty:
+                st.metric("總股數", f"{df['shares_held'].sum():,}")
+                st.dataframe(df)
+            else: st.info("無資料")
+
         elif menu == "📂 批次匯入":
             st.header("批次匯入")
             replace = st.checkbox("⚠️ 覆寫持股數")
@@ -490,28 +478,22 @@ def run_main_app(role, user_name, user_id):
         elif menu == "✍️ 申請交易":
             st.header("申請轉讓")
             
-            # 1. 取得基本資料
             df_sh = sys.get_df("shareholders")
             me = df_sh[df_sh['tax_id'].astype(str) == str(user_id)]
             
             if not me.empty:
                 my_shares = int(me.iloc[0]['shares_held'] or 0)
                 
-                # 2. 計算已申請但未核准的股數 (防呆)
                 df_req = sys.get_df("requests")
                 pending_sum = 0
                 my_pending_reqs = pd.DataFrame()
                 
                 if not df_req.empty and "applicant" in df_req.columns:
-                    # 篩選我的申請
                     my_reqs = df_req[df_req['applicant'].astype(str) == str(user_id)]
-                    # 篩選 Pending 狀態
                     my_pending_reqs = my_reqs[my_reqs['status'] == "Pending"]
-                    # 計算總和
                     if not my_pending_reqs.empty:
                         pending_sum = my_pending_reqs['amount'].sum()
 
-                # 3. 顯示按鈕與對話框
                 if st.button("📝 填寫申請單"):
                     show_request_dialog(user_id, my_shares, pending_sum)
                 
@@ -519,7 +501,6 @@ def run_main_app(role, user_name, user_id):
                 st.subheader("申請進度 (待審核)")
                 
                 if not my_pending_reqs.empty:
-                    # 顯示列表並提供刪除功能
                     for i, r in my_pending_reqs.iterrows():
                         c1, c2, c3, c4 = st.columns([2, 2, 3, 2])
                         c1.write(f"日期: {r['date']}")
@@ -529,11 +510,10 @@ def run_main_app(role, user_name, user_id):
                             show_cancel_request_dialog(r['id'])
                         st.markdown("---")
                     
-                    st.info(f"目前凍結股數: {pending_sum:,} (待審核中，不可再次交易)")
+                    st.info(f"目前凍結股數: {pending_sum:,}")
                 else:
                     st.info("目前無待審核的申請")
                 
-                # 顯示被退件或已完成的紀錄
                 st.subheader("歷史申請紀錄")
                 if not df_req.empty:
                      history = df_req[(df_req['applicant'].astype(str) == str(user_id)) & (df_req['status'] != "Pending")]
