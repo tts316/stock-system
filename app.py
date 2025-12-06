@@ -12,11 +12,12 @@ from googleapiclient.http import MediaIoBaseUpload
 from google.cloud import vision
 from gspread.exceptions import APIError
 import re
+from PIL import Image, ImageEnhance
 
 # --- 1. 系統設定區 ---
-st.set_page_config(page_title="股務管理系統 (旗艦完整版)", layout="wide")
+st.set_page_config(page_title="股務管理系統 (終極完整版)", layout="wide")
 
-# Email 設定
+# Email 設定 (若無則使用模擬模式)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SENDER_EMAIL = ""  
@@ -29,12 +30,13 @@ class GoogleServices:
 
     def connect(self):
         try:
-            # 定義權限 Scope (包含 Sheet, Drive, Cloud Platform)
+            # 定義權限 Scope
             scope = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
                 "https://www.googleapis.com/auth/cloud-platform"
             ]
+            # 讀取 Secrets
             creds_dict = dict(st.secrets["gcp_service_account"])
             self.creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
             
@@ -42,12 +44,14 @@ class GoogleServices:
             self.gc = gspread.authorize(self.creds)
             sheet_url = st.secrets["sheet_config"]["spreadsheet_url"]
             self.sh = self.gc.open_by_url(sheet_url)
+            
+            # 載入所有工作表
             self.ws_sh = self.sh.worksheet("shareholders")
             self.ws_tx = self.sh.worksheet("transactions")
             self.ws_adm = self.sh.worksheet("system_admin")
             self.ws_req = self.sh.worksheet("requests")
             
-            # 嘗試連線 logs 分頁，若無則建立或忽略
+            # 嘗試連線 logs 分頁，若無則設為 None
             try: self.ws_log = self.sh.worksheet("change_logs")
             except: self.ws_log = None
 
@@ -58,11 +62,12 @@ class GoogleServices:
             self.vision_client = vision.ImageAnnotatorClient(credentials=self.creds)
 
         except Exception as e:
-            st.error(f"連線失敗: {e}")
+            st.error(f"連線失敗，請檢查網路或 Secrets 設定: {e}")
             st.stop()
 
+    # --- 讀取資料 (含欄位清理) ---
     def get_df(self, table_name):
-        for i in range(3):
+        for i in range(3): # 重試機制
             try:
                 data = []
                 if table_name == "shareholders": data = self.ws_sh.get_all_records()
@@ -71,7 +76,7 @@ class GoogleServices:
                 elif table_name == "logs" and self.ws_log: data = self.ws_log.get_all_records()
                 
                 df = pd.DataFrame(data)
-                # 自動去除欄位空白
+                # 自動去除欄位名稱的前後空白，避免 KeyError
                 if not df.empty: df.columns = df.columns.str.strip()
                 return df
             except APIError: time.sleep(1)
@@ -80,6 +85,7 @@ class GoogleServices:
     # --- 圖片上傳 Google Drive ---
     def upload_image_to_drive(self, file_obj, filename):
         try:
+            # 檢查資料夾是否存在
             query = "name='StockSystem_Images' and mimeType='application/vnd.google-apps.folder' and trashed=false"
             results = self.drive_service.files().list(q=query, fields="files(id)").execute()
             files = results.get('files', [])
@@ -91,41 +97,63 @@ class GoogleServices:
             else:
                 folder_id = files[0]['id']
 
+            # 上傳檔案
             file_metadata = {'name': filename, 'parents': [folder_id]}
+            file_obj.seek(0) # 重置指標
             media = MediaIoBaseUpload(file_obj, mimetype=file_obj.type, resumable=True)
             file = self.drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+            
+            # 開啟公開讀取權限
             self.drive_service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
             return file.get('webViewLink')
         except Exception as e:
             return None
 
-    # --- OCR 辨識 (優化版) ---
+    # --- 影像前處理 (增強 OCR) ---
+    def preprocess_image(self, image_bytes):
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.5) 
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(2.0)
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG', quality=95) 
+            return img_byte_arr.getvalue()
+        except: return image_bytes
+
+    # --- OCR 辨識 ---
     def ocr_id_card(self, content):
         try:
-            image = vision.Image(content=content)
+            enhanced_content = self.preprocess_image(content)
+            image = vision.Image(content=enhanced_content)
             response = self.vision_client.text_detection(image=image)
             texts = response.text_annotations
             
-            if not texts: return False, "❌ 無法辨識任何文字，請確認照片方向正確且未反光。"
+            if not texts: return False, "❌ 無法辨識文字，請確認光線充足且未反光。"
 
             full_text = texts[0].description
             name, address = "", ""
             
-            if "身分證" not in full_text and "中華民國" not in full_text:
-                return False, "⚠️ 這看起來不像身分證，請重新拍攝。"
+            # 關鍵字檢核
+            # if "身分證" not in full_text and "中華民國" not in full_text:
+            #     return False, "⚠️ 這看起來不像身分證，請重新拍攝。"
 
-            name_match = re.search(r"姓名\s*([^\n]+)", full_text)
+            # 抓取姓名
+            name_match = re.search(r"姓名\s*[:：]?\s*([\u4e00-\u9fa5]{2,4})", full_text)
             if name_match: name = name_match.group(1).strip()
             
+            # 抓取地址
             lines = full_text.split('\n')
             for line in lines:
-                if any(x in line for x in ['縣', '市', '區', '路', '街', '號']):
-                    if "戶政事務所" not in line and len(line) > 8:
-                        address = line.strip()
+                clean_line = line.replace(" ", "")
+                if any(x in clean_line for x in ['縣', '市', '區', '路', '街', '號']):
+                    if "戶政" not in clean_line and len(clean_line) > 6:
+                        address = clean_line.replace("住址", "").replace("地址", "").strip()
                         break
             
             if not name and not address:
-                return False, "⚠️ 影像太模糊或被遮擋，無法讀取關鍵資料。"
+                return False, "⚠️ 影像模糊，請嘗試重新對焦拍攝。"
                 
             return True, {"name": name, "address": address}
         except Exception as e:
@@ -136,15 +164,15 @@ class GoogleServices:
         try:
             cell = self.ws_sh.find(tax_id, in_column=1)
             if not cell: return False, "找不到資料"
+            
             headers = self.ws_sh.row_values(1)
-            headers = [h.strip() for h in headers] # 清理 Header
+            headers = [h.strip() for h in headers]
             
             old_row = self.ws_sh.row_values(cell.row)
             while len(old_row) < len(headers): old_row.append("")
             current_data = dict(zip(headers, old_row))
             changes = []
             
-            # 欄位對應: Sheet Header -> new_data Key
             for key, val in new_data.items():
                 if key in headers:
                     new_val = str(val)
@@ -154,22 +182,25 @@ class GoogleServices:
                         col_idx = headers.index(key) + 1
                         self.ws_sh.update_cell(cell.row, col_idx, new_val)
             
-            if changes:
-                if self.ws_log: self.ws_log.append_rows(changes)
+            if changes and self.ws_log:
+                self.ws_log.append_rows(changes)
                 return True, f"已更新 {len(changes)} 個欄位"
-            else:
-                return True, "資料無變更" # 即使無文字變更，圖片上傳成功也會視為成功
+            return True, "資料已儲存 (無欄位變更)"
         except Exception as e: return False, str(e)
 
-    # --- 批次匯入 (極速版) ---
+    # --- 批次匯入 (全量處理) ---
     def batch_import_from_excel(self, df_excel, replace_shares=False):
         try:
             current = self.ws_sh.get_all_records()
+            # 建立 Map
             db_map = {str(item['tax_id']).strip(): item for item in current}
             cnt = 0
-            for i, row in df_excel.iterrows():
+            
+            for index, row in df_excel.iterrows():
                 tid = str(row.get("身分證或統編", "")).strip()
                 if not tid: continue
+                
+                # 準備新資料
                 new_info = {
                     'name': str(row.get("姓名", "")).strip(),
                     'holder_type': "Corporate" if "法人" in str(row.get("身分別", "")) else "Individual",
@@ -179,47 +210,53 @@ class GoogleServices:
                     'email': str(row.get("Email", "")),
                     'password_hint': str(row.get("密碼提示", ""))
                 }
+                
                 shares = 0
                 try: shares = int(row.get("持股數") or row.get("初始持股數") or 0)
                 except: pass
 
                 if tid in db_map:
+                    # 舊股東更新
                     db_map[tid].update(new_info)
                     if shares >= 0:
                         if replace_shares: db_map[tid]['shares_held'] = shares
                         else: db_map[tid]['shares_held'] = int(db_map[tid].get('shares_held') or 0) + shares
                 else:
+                    # 新股東建立
                     new_info.update({'tax_id': tid, 'shares_held': shares, 'password': "", 'phone': "", 'id_image_url': ""})
                     db_map[tid] = new_info
                 cnt += 1
             
+            # 轉回 List 準備寫入
             final_data = []
             headers = ["tax_id", "name", "holder_type", "representative", "household_address", "mailing_address", "phone", "email", "password_hint", "shares_held", "password", "id_image_url"]
+            
             for k, v in db_map.items():
-                final_data.append([v.get(h, "") for h in headers])
+                row_data = [v.get(h, "") for h in headers]
+                final_data.append(row_data)
             
             self.ws_sh.clear()
             self.ws_sh.append_row(headers)
             self.ws_sh.append_rows(final_data)
-            return True, f"匯入成功，共處理 {cnt} 筆"
+            return True, f"匯入成功，共處理 {cnt} 筆資料"
         except Exception as e: return False, str(e)
 
-    # --- 申請與交易 ---
+    # --- 申請單邏輯 ---
     def add_request(self, applicant_id, amount, reason):
         try:
             cell = self.ws_sh.find(applicant_id, in_column=1)
-            # Col 10 is shares_held
+            # col 10 is shares_held
             curr = int(self.ws_sh.cell(cell.row, 10).value or 0) 
             
             reqs = self.ws_req.get_all_records()
             pending = sum([int(r['amount']) for r in reqs if str(r['applicant'])==str(applicant_id) and r['status']=='Pending'])
             
             available = curr - pending
-            if amount > available: return False, f"股數不足 (可用: {available})"
+            if amount > available: return False, f"額度不足 (持有:{curr}, 凍結:{pending})"
             
             rid = int(time.time())
             self.ws_req.append_row([rid, datetime.now().strftime("%Y-%m-%d"), applicant_id, "", amount, "Pending", reason, ""])
-            return True, "已送出"
+            return True, "已送出申請"
         except Exception as e: return False, str(e)
 
     def approve_request(self, req_id, date, s_id, b_id, amount):
@@ -247,9 +284,10 @@ class GoogleServices:
             if cell and self.ws_req.cell(cell.row, 6).value == "Pending":
                 self.ws_req.delete_rows(cell.row)
                 return True, "已撤銷"
-            return False, "無法撤銷"
+            return False, "無法撤銷 (可能已審核)"
         except: return False, "Error"
 
+    # --- 股權轉讓核心 ---
     def transfer_shares(self, date, s_id, b_id, amount, reason):
         try:
             s_cell = self.ws_sh.find(s_id, in_column=1)
@@ -259,7 +297,7 @@ class GoogleServices:
             s_shares = int(self.ws_sh.cell(s_cell.row, 10).value or 0)
             b_shares = int(self.ws_sh.cell(b_cell.row, 10).value or 0)
             
-            if s_shares < amount: return False, "股數不足"
+            if s_shares < amount: return False, "賣方股數不足"
             
             self.ws_sh.update_cell(s_cell.row, 10, s_shares - amount)
             self.ws_sh.update_cell(b_cell.row, 10, b_shares + amount)
@@ -267,7 +305,7 @@ class GoogleServices:
             return True, "成功"
         except Exception as e: return False, str(e)
 
-    # --- 基本功能 (Upsert, Issue, Delete, Verify) ---
+    # --- 單筆管理功能 ---
     def upsert_shareholder(self, tax_id, name, holder_type, address, representative, email, hint):
         try:
             tax_id = str(tax_id).strip()
@@ -275,6 +313,7 @@ class GoogleServices:
             try: cell = self.ws_sh.find(tax_id)
             except: time.sleep(1); cell = self.ws_sh.find(tax_id)
             
+            # 若不存在，新增完整列 (確保長度正確)
             row_data = [tax_id, name, holder_type, representative, address, address, "", email, hint, 0, "", ""]
             
             if cell: return False, "股東已存在"
@@ -307,6 +346,7 @@ class GoogleServices:
             return None
         except: return None
 
+    # --- 登入與密碼 ---
     def verify_login(self, username, password, is_admin):
         try:
             ws = self.ws_adm if is_admin else self.ws_sh
@@ -358,102 +398,7 @@ def get_db_system(): return GoogleServices()
 try: sys = get_db_system()
 except: st.error("連線逾時"); st.stop()
 
-# --- UI Components ---
-@st.dialog("📝 編輯個人資料")
-def show_profile_edit_dialog(user_data):
-    st.info("請更新您的資料，若有上傳身分證，系統將自動進行辨識。")
-    with st.expander("📸 拍攝指南 (點擊展開)"):
-        st.markdown("1. 光線充足 2. 避免反光 3. 填滿畫面 4. 水平拍攝")
-
-    with st.form("profile_form"):
-        col1, col2 = st.columns(2)
-        if "ocr_name" not in st.session_state: st.session_state.ocr_name = user_data['name']
-        if "ocr_addr" not in st.session_state: st.session_state.ocr_addr = str(user_data.get('household_address', ''))
-
-        new_name = col1.text_input("姓名", value=st.session_state.ocr_name)
-        new_phone = col2.text_input("手機", value=str(user_data.get('phone', '')))
-        new_h_addr = st.text_input("戶籍地址", value=st.session_state.ocr_addr)
-        new_m_addr = st.text_input("通訊地址", value=str(user_data.get('mailing_address', '')))
-        new_email = st.text_input("Email", value=str(user_data.get('email', '')))
-        
-        st.markdown("---")
-        st.write("🆔 身分證")
-        img_method = st.radio("方式", ["上傳", "相機"], horizontal=True)
-        img_file = st.file_uploader("檔案", type=['jpg','png']) if img_method=="上傳" else st.camera_input("拍照")
-        
-        if img_file: st.image(img_file, width=200)
-
-        c_ocr, c_save = st.columns([1,1])
-        do_ocr = c_ocr.form_submit_button("🔍 辨識")
-        do_save = c_save.form_submit_button("💾 儲存", type="primary")
-
-        if do_ocr:
-            if not img_file: st.error("請先選擇圖片")
-            else:
-                with st.spinner("分析中..."):
-                    succ, res = sys.ocr_id_card(img_file.getvalue())
-                    if succ:
-                        st.success("辨識成功，請手動確認資料")
-                        st.info(f"姓名: {res['name']}"); st.info(f"地址: {res['address']}")
-                    else: st.error(res)
-
-        if do_save:
-            ud = {'name': new_name, 'phone': new_phone, 'household_address': new_h_addr, 'mailing_address': new_m_addr, 'email': new_email}
-            if img_file:
-                with st.spinner("上傳中..."):
-                    link = sys.upload_image_to_drive(img_file, f"{user_data['tax_id']}_{int(time.time())}.jpg")
-                    if link: ud['id_image_url'] = link
-            succ, msg = sys.update_shareholder_profile(st.session_state.user_name, user_data['tax_id'], ud)
-            if succ:
-                st.success(msg)
-                if "ocr_name" in st.session_state: del st.session_state.ocr_name
-                if "ocr_addr" in st.session_state: del st.session_state.ocr_addr
-                time.sleep(1.5); st.rerun()
-            else: st.error(msg)
-
-@st.dialog("✍️ 提出交易申請")
-def show_request_dialog(applicant_id, current_shares, pending_shares):
-    st.info(f"持有: {current_shares} | 凍結: {pending_shares}")
-    available = current_shares - pending_shares
-    with st.form("req"):
-        amt = st.number_input("股數", min_value=1, max_value=available if available>0 else 1)
-        rsn = st.text_input("原因")
-        if st.form_submit_button("送出"):
-            if available <= 0 or amt > available: st.error("額度不足")
-            elif not rsn: st.error("請填寫原因")
-            else:
-                s, m = sys.add_request(applicant_id, amt, rsn)
-                if s: st.success(m); time.sleep(1); st.rerun()
-                else: st.error(m)
-
-@st.dialog("📋 核定")
-def show_approve_dialog(req_data, user_list):
-    st.write(f"申請人: {req_data['applicant']}, 股數: {req_data['amount']}")
-    with st.form("appr"):
-        opts = [x for x in user_list if x.split(" | ")[0] != str(req_data['applicant'])]
-        target = st.selectbox("買方", opts)
-        if st.form_submit_button("✅ 確認"):
-            s, m = sys.approve_request(req_data['id'], datetime.today().strftime("%Y-%m-%d"), req_data['applicant'], target.split(" | ")[0], req_data['amount'])
-            if s: st.success(m); time.sleep(1); st.rerun()
-            else: st.error(m)
-
-@st.dialog("❌ 退件")
-def show_reject_dialog(req_id):
-    with st.form("rej"):
-        r = st.text_input("原因")
-        if st.form_submit_button("確認"):
-            s, m = sys.reject_request(req_id, r)
-            if s: st.success(m); time.sleep(1); st.rerun()
-            else: st.error(m)
-
-@st.dialog("🗑️ 刪除申請")
-def show_cancel_request_dialog(req_id):
-    st.warning("撤銷申請？")
-    if st.button("確認"):
-        s, m = sys.delete_request(req_id)
-        if s: st.success(m); time.sleep(1); st.rerun()
-        else: st.error(m)
-
+# --- UI Dialogs ---
 def send_recovery_email(to, uid, pwd):
     if not SENDER_EMAIL: return True, "模擬發送"
     try:
@@ -477,6 +422,131 @@ def show_password_dialog(role, uid):
         if st.form_submit_button("修改"):
             if p1==p2 and h: sys.update_password(uid, p1, h, role=="admin"); st.success("OK"); time.sleep(1); st.session_state.logged_in=False; st.rerun()
 
+@st.dialog("📝 編輯個人資料 (雙面辨識)")
+def show_profile_edit_dialog(user_data):
+    st.info("請依序拍攝證件正面與反面。")
+    with st.expander("📸 拍攝技巧", expanded=False):
+        st.markdown("1. 光線充足 2. 避免反光 3. 填滿畫面")
+
+    if "temp_name" not in st.session_state: st.session_state.temp_name = user_data['name']
+    if "temp_addr" not in st.session_state: st.session_state.temp_addr = str(user_data.get('household_address', ''))
+
+    tab1, tab2, tab3 = st.tabs(["1️⃣ 正面", "2️⃣ 反面", "3️⃣ 確認"])
+
+    with tab1:
+        front_img = st.camera_input("正面", key="cam_front")
+        if front_img:
+            st.image(front_img, width=200)
+            if st.button("🔍 辨識正面"):
+                with st.spinner("分析中..."):
+                    s, r = sys.ocr_id_card(front_img.getvalue())
+                    if s: 
+                        st.success("成功")
+                        if r['name']: st.session_state.temp_name = r['name']
+                        if r['address']: st.session_state.temp_addr = r['address']
+                    else: st.error(r)
+
+    with tab2:
+        back_img = st.camera_input("反面", key="cam_back")
+        if back_img:
+            st.image(back_img, width=200)
+            if st.button("🔍 辨識反面"):
+                with st.spinner("分析中..."):
+                    s, r = sys.ocr_id_card(back_img.getvalue())
+                    if s and r['address']: st.info(f"偵測地址: {r['address']}")
+                    else: st.warning("未偵測到地址")
+
+    with tab3:
+        with st.form("final"):
+            n = st.text_input("姓名", value=st.session_state.temp_name)
+            p = st.text_input("手機", value=str(user_data.get('phone', '')))
+            ha = st.text_input("戶籍", value=st.session_state.temp_addr)
+            ma = st.text_input("通訊", value=str(user_data.get('mailing_address', '')))
+            e = st.text_input("Email", value=str(user_data.get('email', '')))
+            
+            if st.form_submit_button("💾 儲存", type="primary"):
+                ud = {'name': n, 'phone': p, 'household_address': ha, 'mailing_address': ma, 'email': e}
+                if front_img:
+                    link = sys.upload_image_to_drive(front_img, f"{user_data['tax_id']}_f_{int(time.time())}.jpg")
+                    if link: ud['id_image_url'] = link
+                s, m = sys.update_shareholder_profile(st.session_state.user_name, user_data['tax_id'], ud)
+                if s: st.success(m); time.sleep(1.5); st.rerun()
+                else: st.error(m)
+
+@st.dialog("✍️ 申請交易")
+def show_request_dialog(uid, curr, pend):
+    avail = curr - pend
+    st.info(f"可用: {avail}")
+    with st.form("req"):
+        a = st.number_input("股數", 1, max_value=avail if avail>0 else 1)
+        r = st.text_input("原因")
+        if st.form_submit_button("送出"):
+            if avail <= 0: st.error("不足")
+            else:
+                s, m = sys.add_request(uid, a, r)
+                if s: st.success(m); time.sleep(1); st.rerun()
+                else: st.error(m)
+
+@st.dialog("📋 核定")
+def show_approve_dialog(req, users):
+    st.write(f"申請人: {req['applicant']}, 股數: {req['amount']}")
+    with st.form("appr"):
+        opts = [x for x in users if x.split(" | ")[0] != str(req['applicant'])]
+        tgt = st.selectbox("買方", opts)
+        if st.form_submit_button("確認"):
+            s, m = sys.approve_request(req['id'], datetime.now().strftime("%Y-%m-%d"), req['applicant'], tgt.split(" | ")[0], req['amount'])
+            if s: st.success(m); time.sleep(1); st.rerun()
+            else: st.error(m)
+
+@st.dialog("❌ 退件")
+def show_reject_dialog(rid):
+    with st.form("rej"):
+        r = st.text_input("原因")
+        if st.form_submit_button("確認"):
+            sys.reject_request(rid, r); st.success("已退"); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 撤銷")
+def show_cancel_request_dialog(rid):
+    st.warning("撤銷？")
+    if st.button("確認"):
+        sys.delete_request(rid); st.success("已撤"); time.sleep(1); st.rerun()
+
+@st.dialog("✏️ 修改(Admin)")
+def show_edit_dialog(current_data):
+    with st.form("edit_form"):
+        new_tax_id = st.text_input("統編", value=str(current_data['tax_id']), disabled=True)
+        new_name = st.text_input("姓名", value=current_data['name'])
+        t_opts = ["Individual", "Corporate"]
+        t_idx = t_opts.index(current_data['holder_type']) if current_data['holder_type'] in t_opts else 0
+        new_type = st.selectbox("類別", t_opts, index=t_idx)
+        new_h = st.text_input("戶籍", value=str(current_data['household_address']))
+        new_m = st.text_input("通訊", value=str(current_data['mailing_address']))
+        new_rep = st.text_input("代表人", value=str(current_data['representative']))
+        new_email = st.text_input("Email", value=str(current_data['email']))
+        new_hint = st.text_input("提示", value=str(current_data['password_hint']))
+        
+        if st.form_submit_button("更新"):
+            ud = {'name': new_name, 'holder_type': new_type, 'representative': new_rep, 
+                  'household_address': new_h, 'mailing_address': new_m, 'email': new_email, 'password_hint': new_hint}
+            succ, msg = sys.update_shareholder_profile("Admin", new_tax_id, ud)
+            if succ: st.success(msg); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 刪除")
+def show_delete_dialog(tid, name):
+    st.warning(f"刪除 {name}?")
+    if st.button("確認"): sys.delete_shareholder(tid); st.success("OK"); time.sleep(1); st.rerun()
+
+@st.dialog("🗑️ 批次刪除")
+def show_batch_delete_dialog(selected_list):
+    st.warning(f"刪除 {len(selected_list)} 筆?")
+    if st.button("確認"):
+        ids = [i.split(" | ")[0] for i in selected_list]
+        sys.delete_batch_shareholders(ids)
+        st.success("OK")
+        for k in list(st.session_state.keys()):
+            if k.startswith("sel_"): del st.session_state[k]
+        time.sleep(1); st.rerun()
+
 # --- Main App ---
 def run_main_app(role, user_name, user_id):
     with st.sidebar:
@@ -485,7 +555,6 @@ def run_main_app(role, user_name, user_id):
         if st.button("登出"): st.session_state.logged_in=False; st.rerun()
         
         if role == "admin":
-            # 確保這裡列出了所有功能
             menu = st.radio("選單", ["📊 股東名簿總覽", "✅ 審核交易申請", "📂 批次匯入", "➕ 新增股東", "💰 發行/增資", "🤝 股權過戶", "📝 交易歷史", "📝 修改紀錄查詢"])
         else:
             menu = st.radio("選單", ["👤 個人資料維護", "📝 我的持股", "📜 交易紀錄查詢", "✍️ 申請交易"])
@@ -498,7 +567,36 @@ def run_main_app(role, user_name, user_id):
             if not df.empty and 'shares_held' in df.columns:
                 total = pd.to_numeric(df['shares_held'], errors='coerce').fillna(0).sum()
                 st.metric("總股數", f"{total:,}")
+                
+                search = st.text_input("搜尋")
+                if search: df = df[df['name'].astype(str).str.contains(search) | df['tax_id'].astype(str).str.contains(search)]
+                
+                # 批次刪除邏輯
+                def toggle_all():
+                    val = st.session_state.master_select
+                    for t in df['tax_id']: st.session_state[f"sel_{t}"] = val
+                
+                sel_ids = []
+                for t in df['tax_id']:
+                    if st.session_state.get(f"sel_{t}", False):
+                        n = df[df['tax_id']==t].iloc[0]['name']
+                        sel_ids.append(f"{t} | {n}")
+                
+                c1, c2 = st.columns([1,4])
+                c1.checkbox("全選", key="master_select", on_change=toggle_all)
+                if sel_ids: 
+                    if c2.button(f"刪除 ({len(sel_ids)})"): show_batch_delete_dialog(sel_ids)
+
                 st.dataframe(df)
+                
+                # 操作按鈕列
+                st.write("單筆操作:")
+                for i, r in df.iterrows():
+                    with st.expander(f"{r['name']} ({r['tax_id']})"):
+                        c1, c2 = st.columns(2)
+                        if c1.button("編輯", key=f"e_{r['tax_id']}"): show_edit_dialog(r)
+                        if c2.button("刪除", key=f"d_{r['tax_id']}"): show_delete_dialog(r['tax_id'], r['name'])
+
             else: st.info("無資料")
             
         elif menu == "✅ 審核交易申請":
